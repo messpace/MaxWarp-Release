@@ -1,0 +1,179 @@
+name: release
+
+# Builds and publishes a MaxWarp release.
+#
+# Trigger: push a `v*` tag. The release wizard in the private repo does that as
+# its last act, so a normal release needs no manual step here.
+#
+# Flow:
+#   1. preflight — asserts the tag matches the version declared in
+#      CMakeLists.txt. A mismatched tag stops the release before anything is
+#      built or published.
+#   2. build — Windows x64 only, because MaxWarp is a SimConnect client and
+#      MSFS 2024 is Windows only. Produces both artifacts:
+#        - MaxWarp-vX.Y.Z-win-x64.zip        portable, unzip and run
+#        - MaxWarp-vX.Y.Z-win-x64-setup.exe  Inno Setup installer
+#   3. publish — opens the GitHub Release for the tag, attaches both, and
+#      publishes it outright. Pushing the tag IS the decision to release; there
+#      is no draft to go back and un-draft.
+#
+# SimConnect comes from third_party/SimConnect in this repo (see the README
+# there); a hosted runner has no MSFS 2024 SDK, so there is nothing to install.
+# Qt is the one heavy dependency and is cached between runs.
+#
+# workflow_dispatch is available for a dry run: it builds and uploads the two
+# files as workflow artifacts without creating or touching a Release.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  QT_VERSION: 6.10.2
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert the tag matches CMakeLists.txt
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          declared=$(sed -n 's/^project(MaxWarp VERSION \([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p' CMakeLists.txt)
+          if [ -z "$declared" ]; then
+            echo "::error::could not read the version out of CMakeLists.txt"
+            exit 1
+          fi
+          echo "declared version: $declared"
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            echo "tag version:      $tag"
+            if [ "$tag" != "$declared" ]; then
+              echo "::error::tag v$tag does not match CMakeLists.txt ($declared). Nothing is built."
+              exit 1
+            fi
+          else
+            echo "manual run - no tag to check against"
+          fi
+          echo "version=$declared" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: preflight
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt ${{ env.QT_VERSION }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64 `
+            -DMAXWARP_QT_ROOT="$env:QT_ROOT_DIR"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      # windeployqt resolves the Qt runtime the exe actually needs - Core, Gui,
+      # Network, Qml, Quick, the QML module tree and the platform plugin - into
+      # a self-contained folder. --qmldir points it at the QML this app owns so
+      # the imports Main.qml uses are pulled in too.
+      - name: Stage the portable tree
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\MaxWarp | Out-Null
+          Copy-Item build\Release\MaxWarp.exe      dist\MaxWarp\
+          Copy-Item build\Release\SimConnect.dll   dist\MaxWarp\
+          Copy-Item LICENSE                        dist\MaxWarp\LICENSE.txt
+          Copy-Item README.md                      dist\MaxWarp\
+          Copy-Item fonts\OFL-*.txt                dist\MaxWarp\
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" `
+              --release --no-translations --no-system-d3d-compiler `
+              --qmldir qml dist\MaxWarp\MaxWarp.exe
+          if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
+
+      - name: Assert the staged tree is runnable
+        shell: pwsh
+        run: |
+          $need = @('MaxWarp.exe','SimConnect.dll','Qt6Core.dll','Qt6Quick.dll','platforms\qwindows.dll')
+          $missing = $need | Where-Object { -not (Test-Path "dist\MaxWarp\$_") }
+          if ($missing) { throw "staged tree is missing: $($missing -join ', ')" }
+          "{0} files, {1:N1} MB" -f `
+            (Get-ChildItem dist\MaxWarp -Recurse -File).Count, `
+            ((Get-ChildItem dist\MaxWarp -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Zip the portable build
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\MaxWarp\* `
+            -DestinationPath "dist\MaxWarp-v$env:VERSION-win-x64.zip"
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+              "/DMaxWarpVersion=$env:VERSION" installer\MaxWarp.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MaxWarp-win-x64
+          path: |
+            dist/*.zip
+            dist/*setup.exe
+          if-no-files-found: error
+
+  publish:
+    needs: [preflight, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: MaxWarp-win-x64
+          path: dist
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: MaxWarp ${{ github.ref_name }}
+          # Published outright, not as a draft: the tag is the decision, and it
+          # was already made in the wizard. fail_on_unmatched_files matters more
+          # for the same reason - a release that goes live with a missing
+          # artifact is worse than one that never opens.
+          draft: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.zip
+            dist/*setup.exe
+          body: |
+            MaxWarp ${{ github.ref_name }} — Windows x64.
+
+            - **Installer** — `MaxWarp-v${{ needs.preflight.outputs.version }}-win-x64-setup.exe`
+            - **Portable** — `MaxWarp-v${{ needs.preflight.outputs.version }}-win-x64.zip`, unzip anywhere and run `MaxWarp.exe`
+
+            Both carry the Qt 6 runtime and `SimConnect.dll`; nothing else needs
+            installing. MSFS 2024 must be running for the app to connect.

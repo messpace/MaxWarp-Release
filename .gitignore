@@ -1,0 +1,12 @@
+# CMake build trees.
+build/
+build-*/
+out/
+
+# Visual Studio / VS Code local state.
+.vs/
+.vscode/
+CMakeUserPresets.json
+
+# Release staging produced by the CI workflow.
+dist/
